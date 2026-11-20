@@ -1,8 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  buildCubeData,
-  buildCubeDataFromCorners,
-  defaultCorners,
   buildArrows,
   perspective,
   translation,
@@ -11,27 +8,74 @@ import {
   multiply,
   BYTE_STRIDE,
   FLOATS_PER_VERTEX,
-  CORNERS,
   AXIS_DIRS,
   GIZMO_TIP_DIST,
+  GIZMO_SCALE,
   transform4,
   rayCubeNearT,
   invert,
   rayFromCursor,
   raySphere,
   rayCapsule,
-  FACE_CORNERS,
-  centroidOf,
-  faceFromSurfacePoint,
+  defaultMesh,
+  buildMeshData,
+  extrudeFace,
+  faceCentroid,
+  rayPoly,
 } from "./geometry";
-import type { Vec3 } from "./geometry";
+import type { Vec3, DynMesh } from "./geometry";
 
 // ── WGSL shader ─────────────────────────────────────────────────────────────
-// A vertex buffer supplies a position (vec3) and a color (vec4) per vertex.
-// A single mat4 uniform (uMVP = projection * view * model) turns the local
-// cube into screen space.
+// A vertex buffer supplies a position (vec3), a normal (vec3) and a color
+// (vec4) per vertex. uMVP (projection * view * model) turns the local cube into
+// screen space, and uModel (the model rotation) orients each normal into world
+// space so a fixed directional light can shade it. The faces are all one flat
+// grey; the lighting — not the colour — is what tells them apart.
 
 const shader = /* wgsl */ `
+@group(0) @binding(0) var<uniform> uMVP : mat4x4f;
+@group(0) @binding(1) var<uniform> uModel : mat4x4f;
+
+struct VSOut {
+  @builtin(position) position : vec4f,
+  @location(0) color : vec4f,
+  @location(1) worldNormal : vec3f,
+};
+
+// A fixed directional light in world space, plus a soft ambient floor so the
+// faces turned away from it never go fully black.
+const LIGHT_DIR = normalize(vec3f(0.4, 0.8, 0.6));
+const AMBIENT = 0.35;
+
+@vertex
+fn vertexMain(
+  @location(0) position : vec3f,
+  @location(1) normal : vec3f,
+  @location(2) color : vec4f,
+) -> VSOut {
+  var out : VSOut;
+  out.position = uMVP * vec4f(position, 1.0);
+  // model is a pure rotation, so its 3x3 part orients the normal without
+  // stretching it; the translation columns are ignored.
+  out.worldNormal = mat3x3f(uModel[0].xyz, uModel[1].xyz, uModel[2].xyz) * normal;
+  out.color = color;
+  return out;
+}
+
+@fragment
+fn fragmentMain(in : VSOut) -> @location(0) vec4f {
+  let diff = max(dot(normalize(in.worldNormal), LIGHT_DIR), 0.0);
+  let intensity = AMBIENT + (1.0 - AMBIENT) * diff;
+  return vec4f(in.color.rgb * intensity, in.color.a);
+}
+`;
+
+// ── Gizmo shader (flat / unlit) ────────────────────────────────────────────
+// The translation gizmo is a UI overlay, not part of the lit scene, so it is
+// drawn flat: its X/Y/Z axis colours are output as-is, with no lighting and no
+// normals. It shares the cube's xyz + nrm + rgba vertex layout but reads only
+// the position and colour (the normal at location 1 is skipped).
+const gizmoShader = /* wgsl */ `
 @group(0) @binding(0) var<uniform> uMVP : mat4x4f;
 
 struct VSOut {
@@ -42,7 +86,7 @@ struct VSOut {
 @vertex
 fn vertexMain(
   @location(0) position : vec3f,
-  @location(1) color : vec4f,
+  @location(2) color : vec4f,
 ) -> VSOut {
   var out : VSOut;
   out.position = uMVP * vec4f(position, 1.0);
@@ -85,12 +129,16 @@ export default function App() {
   const panXRef = useRef(0); // camera pan in world units — shift+drag
   const panYRef = useRef(0);
 
-  // Live positions of the 8 cube corners (an independent copy of CORNERS). A
-  // gizmo drag mutates these so the dragged vertex reshapes its faces; a ref so
-  // the render loop sees the latest value without a re-render.
-  const cornersRef = useRef(defaultCorners());
-  // Set while a corner has moved, so the cube's GPU buffer gets rebuilt.
-  const dirtyCubeRef = useRef(false);
+  // Live dynamic mesh (verts + faces).  Starts as the unit cube; grows when a
+  // face is extruded.  A ref so the render loop + gizmo see the latest value
+  // without a re-render.
+  const meshRef = useRef<DynMesh>(defaultMesh());
+  // Set while vertices have moved or faces have been added, so the GPU buffer
+  // gets rebuilt.
+  const dirtyMeshRef = useRef(false);
+  // Track whether the mesh structure (face/vert count) changed, requiring a
+  // new GPU buffer allocation.
+  const meshStructureDirtyRef = useRef(false);
   // Active gizmo drag: which corners (one for a vertex, four for a face) and
   // which local axis they are sliding along. `axis` is locked the moment the
   // gizmo is grabbed (ray-cast), so it never changes for the duration of the
@@ -144,6 +192,15 @@ export default function App() {
         setMode("face");
         selectedRef.current = null;
         setSelected(null);
+      } else if (k === "e") {
+        // Extrude the selected face outward along its normal.
+        if (modeRef.current === "face" && faceSelRef.current !== null) {
+          const capIdx = extrudeFace(meshRef.current, faceSelRef.current, 0.3);
+          faceSelRef.current = capIdx;
+          setFaceSel(capIdx);
+          dirtyMeshRef.current = true;
+          meshStructureDirtyRef.current = true;
+        }
       }
     };
     window.addEventListener("keydown", onKey);
@@ -220,14 +277,25 @@ export default function App() {
         context.configure({ device, format });
 
         // 3. Vertex + uniform buffers
-        const cubeData = buildCubeData();
-        const vertexBuffer = device.createBuffer({
-          size: cubeData.byteLength,
+        // Start with a generous buffer so a few extrudes fit without realloc.
+        const MESH_BUF_BYTES = 64 * 1024;
+        let vertexBuffer = device.createBuffer({
+          size: MESH_BUF_BYTES,
           usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
         });
-        device.queue.writeBuffer(vertexBuffer, 0, cubeData);
+        device.queue.writeBuffer(vertexBuffer, 0, buildMeshData(meshRef.current));
 
         const uniformBuffer = device.createBuffer({
+          size: 64, // one mat4x4f
+          usage:
+            GPUBufferUsage.UNIFORM |
+            GPUBufferUsage.COPY_DST |
+            GPUBufferUsage.COPY_SRC,
+        });
+        // The model rotation, shared by the cube and the gizmo (the gizmo only
+        // adds a translation, which doesn't affect normals). Used to orient the
+        // per-vertex normals into world space for lighting.
+        const modelUniform = device.createBuffer({
           size: 64, // one mat4x4f
           usage:
             GPUBufferUsage.UNIFORM |
@@ -244,17 +312,42 @@ export default function App() {
               visibility: GPUShaderStage.VERTEX,
               buffer: { type: "uniform" },
             },
+            {
+              binding: 1,
+              visibility: GPUShaderStage.VERTEX,
+              buffer: { type: "uniform" },
+            },
           ],
         });
+
+        // The gizmo is unlit, so it uses its own (flat) shader module and a
+        // bind group layout that only needs the MVP — no model/lighting uniform.
+        const gizmoShaderModule = device.createShaderModule({
+          code: gizmoShader,
+        });
+        const gizmoBindGroupLayout = device.createBindGroupLayout({
+          entries: [
+            {
+              binding: 0,
+              visibility: GPUShaderStage.VERTEX,
+              buffer: { type: "uniform" },
+            },
+          ],
+        });
+
         const bindGroup = device.createBindGroup({
           layout: bindGroupLayout,
-          entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
+          entries: [
+            { binding: 0, resource: { buffer: uniformBuffer } },
+            { binding: 1, resource: { buffer: modelUniform } },
+          ],
         });
 
         // Vertex translation gizmo. The arrows reuse the cube's shader/pipeline
-        // (same xyz + rgba layout), so we only need their own vertex buffer plus
-        // a second uniform to carry the gizmo's MVP (the cube's MVP post-multiply
-        // a translation onto the selected corner).
+        // (same xyz + nrm + rgba layout), so we only need their own vertex
+        // buffer plus a second uniform to carry the gizmo's MVP (the cube's MVP
+        // post-multiplies a translation onto the selected corner). The lighting
+        // model uniform is shared, since the gizmo only adds a translation.
         const arrowData = buildArrows();
         const arrowBuffer = device.createBuffer({
           size: arrowData.byteLength,
@@ -271,7 +364,7 @@ export default function App() {
             GPUBufferUsage.COPY_SRC,
         });
         const gizmoBindGroup = device.createBindGroup({
-          layout: bindGroupLayout,
+          layout: gizmoBindGroupLayout,
           entries: [{ binding: 0, resource: { buffer: gizmoUniform } }],
         });
 
@@ -287,7 +380,8 @@ export default function App() {
                 arrayStride: BYTE_STRIDE,
                 attributes: [
                   { shaderLocation: 0, offset: 0, format: "float32x3" },
-                  { shaderLocation: 1, offset: 12, format: "float32x4" },
+                  { shaderLocation: 1, offset: 12, format: "float32x3" },
+                  { shaderLocation: 2, offset: 24, format: "float32x4" },
                 ],
               },
             ],
@@ -307,28 +401,30 @@ export default function App() {
           },
         });
 
-        // A second pipeline for the gizmo that disables depth testing so the
-        // arrows always render on top of the cube — visible even when they
-        // intersect or pass behind the geometry.
+        // A second pipeline for the gizmo. It uses the flat (unlit) shader so
+        // the arrows keep their solid X/Y/Z colours, and it disables depth
+        // testing so they always render on top of the cube — visible even when
+        // they intersect or pass behind the geometry. The vertex format skips
+        // the normal (location 1) the unlit shader doesn't need.
         const gizmoPipeline = device.createRenderPipeline({
           layout: device.createPipelineLayout({
-            bindGroupLayouts: [bindGroupLayout],
+            bindGroupLayouts: [gizmoBindGroupLayout],
           }),
           vertex: {
-            module: shaderModule,
+            module: gizmoShaderModule,
             entryPoint: "vertexMain",
             buffers: [
               {
                 arrayStride: BYTE_STRIDE,
                 attributes: [
                   { shaderLocation: 0, offset: 0, format: "float32x3" },
-                  { shaderLocation: 1, offset: 12, format: "float32x4" },
+                  { shaderLocation: 2, offset: 24, format: "float32x4" },
                 ],
               },
             ],
           },
           fragment: {
-            module: shaderModule,
+            module: gizmoShaderModule,
             entryPoint: "fragmentMain",
             targets: [{ format }],
           },
@@ -352,7 +448,7 @@ export default function App() {
         const selectedCornerIndices = (): number[] | null => {
           if (modeRef.current === "face") {
             const f = faceSelRef.current;
-            return f === null ? null : FACE_CORNERS[f];
+            return f === null ? null : meshRef.current.faces[f].corners;
           }
           const v = selectedRef.current;
           return v === null ? null : [v];
@@ -360,8 +456,12 @@ export default function App() {
         // Local-space centre of the current selection — the gizmo's anchor
         // (the corner itself for a vertex, the face's centre for a face).
         const selectedCentroid = (): Vec3 | null => {
-          const idxs = selectedCornerIndices();
-          return idxs ? centroidOf(idxs, cornersRef.current) : null;
+          if (modeRef.current === "face") {
+            const f = faceSelRef.current;
+            return f === null ? null : faceCentroid(meshRef.current, f);
+          }
+          const v = selectedRef.current;
+          return v === null ? null : meshRef.current.verts[v];
         };
         // Anything selected in the active mode?
         const hasSelection = (): boolean => selectedCornerIndices() !== null;
@@ -392,23 +492,23 @@ export default function App() {
           const ldy = ld[1] / ldLen;
           const ldz = ld[2] / ldLen;
 
-          // ── Face mode: select the face the ray first enters the cube
-          // through. The near-intersection point's coordinate nearest the ±0.5
-          // shell names the face; a miss deselects. ──
+          // ── Face mode: ray-test every face quad, pick the nearest hit. ──
           if (modeRef.current === "face") {
-            const tCube = rayCubeNearT(lo[0], lo[1], lo[2], ldx, ldy, ldz);
-            if (tCube === null) {
-              faceSelRef.current = null;
-              setFaceSel(null);
-              return;
+            const mesh = meshRef.current;
+            let bestFace = -1;
+            let bestT = Infinity;
+            for (let fi = 0; fi < mesh.faces.length; fi++) {
+              const f = mesh.faces[fi];
+              // Build the polygon points in local space.
+              const pts: Vec3[] = f.corners.map((ci) => mesh.verts[ci]);
+              const t = rayPoly(lo[0], lo[1], lo[2], ldx, ldy, ldz, pts);
+              if (t !== null && t < bestT) {
+                bestT = t;
+                bestFace = fi;
+              }
             }
-            const f = faceFromSurfacePoint(
-              lo[0] + ldx * tCube,
-              lo[1] + ldy * tCube,
-              lo[2] + ldz * tCube,
-            );
-            faceSelRef.current = f;
-            setFaceSel(f);
+            faceSelRef.current = bestFace >= 0 ? bestFace : null;
+            setFaceSel(faceSelRef.current);
             return;
           }
 
@@ -424,8 +524,8 @@ export default function App() {
           const tCube = rayCubeNearT(lo[0], lo[1], lo[2], ldx, ldy, ldz);
           let best = -1;
           let bestT = Infinity;
-          for (let i = 0; i < CORNERS.length; i++) {
-            const c = cornersRef.current[i];
+          for (let i = 0; i < meshRef.current.verts.length; i++) {
+            const c = meshRef.current.verts[i];
             const t = raySphere(lo[0], lo[1], lo[2], ldx, ldy, ldz, c[0], c[1], c[2], radius);
             if (t === null) continue;
             if (tCube !== null && tCube < t - 1e-2) continue; // a face is in front
@@ -471,7 +571,9 @@ export default function App() {
         // rounded ends — so the grab is exact and orientation-independent.
         // Returns the AXIS_DIRS index (0..2), or -1 when nothing is under the
         // cursor.
-        const GRAB_RADIUS = 0.07; // local/world units — constant in 3D by design
+        // The invisible grab tube grows with the (now scaled-up) gizmo so it
+        // stays as easy to grab as the original; 0.07 was the base target.
+        const GRAB_RADIUS = 0.07 * GIZMO_SCALE; // local/world units
         const grabGizmo = (clientX: number, clientY: number): number => {
           const st = frameRef.current;
           if (!st || !st.invViewProj || !hasSelection()) return -1;
@@ -559,9 +661,16 @@ export default function App() {
             const dy = e.clientY - lastPointerRef.current.y;
             // Project the locked local axis to screen from the *current* centre
             // of the moving corners, so the drag tracks the handle as it moves.
+            // Centroid of the moving corners in the mesh.
+            let cx = 0, cy = 0, cz = 0;
+            for (const ci of g.corners) {
+              const c = meshRef.current.verts[ci];
+              cx += c[0]; cy += c[1]; cz += c[2];
+            }
+            const nn = g.corners.length;
             const s = screenAxis(
               st,
-              centroidOf(g.corners, cornersRef.current),
+              [cx / nn, cy / nn, cz / nn],
               g.axis,
             );
             const len2 = s[0] * s[0] + s[1] * s[1];
@@ -570,12 +679,12 @@ export default function App() {
               // Slide every corner of the handle along the locked axis, clamped
               // to the same box a single vertex respects.
               for (const ci of g.corners) {
-                const c = cornersRef.current[ci];
+                const c = meshRef.current.verts[ci];
                 c[0] = Math.max(-1.5, Math.min(1.5, c[0] + g.axis[0] * t));
                 c[1] = Math.max(-1.5, Math.min(1.5, c[1] + g.axis[1] * t));
                 c[2] = Math.max(-1.5, Math.min(1.5, c[2] + g.axis[2] * t));
               }
-              dirtyCubeRef.current = true;
+              dirtyMeshRef.current = true;
             }
             lastPointerRef.current = { x: e.clientX, y: e.clientY };
             return;
@@ -702,8 +811,9 @@ export default function App() {
               return;
             }
             const dpr = window.devicePixelRatio || 1;
-            const pts = FACE_CORNERS[f].map((ci) =>
-              project(st, cornersRef.current[ci]),
+            const mesh = meshRef.current;
+            const pts = mesh.faces[f].corners.map((ci) =>
+              project(st, mesh.verts[ci]),
             );
             const allFront = pts.every((p) => p[2]);
             if (statusSpanRef.current)
@@ -724,35 +834,57 @@ export default function App() {
             return;
           }
 
-          // ── Vertex mode: a dot on the selected corner. ──
-          const idx = selectedRef.current;
-          if (idx === null) {
-            if (statusSpanRef.current)
-              statusSpanRef.current.textContent = "no vertex selected";
-            return;
-          }
-          const corner = cornersRef.current[idx];
-
-          const clip = transform4(st.mvp, corner[0], corner[1], corner[2], 1);
-          const inFront = clip[3] > 0;
-          const hidden = inFront ? cornerHidden(st, corner) : true;
-          const visible = inFront && !hidden;
-
-          if (statusSpanRef.current)
-            statusSpanRef.current.textContent = visible
-              ? `vertex ${idx} · visible`
-              : `vertex ${idx} · hidden (no highlight)`;
-
-          if (!visible) return;
-
+          // ── Vertex mode: mark every vertex, highlight the selected one. ──
           const dpr = window.devicePixelRatio || 1;
-          const px = (clip[0] / clip[3] * 0.5 + 0.5) * overlay!.width;
-          const py = (1 - (clip[1] / clip[3] * 0.5 + 0.5)) * overlay!.height;
-          // Filled core
-          octx!.beginPath();
-          octx!.arc(px, py, 3.5 * dpr, 0, Math.PI * 2);
-          octx!.fillStyle = "rgba(255,165,0,1)";
-          octx!.fill();
+          const mesh = meshRef.current;
+          const sel = selectedRef.current;
+
+          // Pass 1 — every visible, non-selected vertex gets a small filled dot
+          // (drawn first so the selection paints on top). Vertices behind a face
+          // or behind the camera are skipped.
+          for (let i = 0; i < mesh.verts.length; i++) {
+            if (i === sel) continue;
+            const v = mesh.verts[i];
+            const clip = transform4(st.mvp, v[0], v[1], v[2], 1);
+            if (clip[3] <= 0) continue; // behind the camera
+            if (cornerHidden(st, v)) continue; // behind a face
+            const px = (clip[0] / clip[3] * 0.5 + 0.5) * overlay!.width;
+            const py = (1 - (clip[1] / clip[3] * 0.5 + 0.5)) * overlay!.height;
+            octx!.beginPath();
+            octx!.arc(px, py, 3 * dpr, 0, Math.PI * 2);
+            octx!.fillStyle = "rgba(255,255,255,0.9)";
+            octx!.fill();
+          }
+
+          // Pass 2 — the selected vertex on top, as a ringed orange core.
+          if (sel !== null) {
+            const corner = mesh.verts[sel];
+            const clip = transform4(st.mvp, corner[0], corner[1], corner[2], 1);
+            const inFront = clip[3] > 0;
+            const hidden = inFront ? cornerHidden(st, corner) : true;
+            const visible = inFront && !hidden;
+
+            if (statusSpanRef.current)
+              statusSpanRef.current.textContent = visible
+                ? `vertex ${sel} · visible`
+                : `vertex ${sel} · hidden (no highlight)`;
+
+            if (visible) {
+              const px = (clip[0] / clip[3] * 0.5 + 0.5) * overlay!.width;
+              const py = (1 - (clip[1] / clip[3] * 0.5 + 0.5)) * overlay!.height;
+              octx!.beginPath();
+              octx!.arc(px, py, 6 * dpr, 0, Math.PI * 2);
+              octx!.strokeStyle = "rgba(255,255,255,0.95)";
+              octx!.lineWidth = 1.5 * dpr;
+              octx!.stroke();
+              octx!.beginPath();
+              octx!.arc(px, py, 3.5 * dpr, 0, Math.PI * 2);
+              octx!.fillStyle = "rgba(255,165,0,1)";
+              octx!.fill();
+            }
+          } else if (statusSpanRef.current) {
+            statusSpanRef.current.textContent = "no vertex selected";
+          }
         }
 
         function render() {
@@ -774,6 +906,9 @@ export default function App() {
           const viewProj = multiply(proj, view);
           const mvp = multiply(viewProj, model);
           device.queue.writeBuffer(uniformBuffer, 0, mvp);
+          // Feed the model rotation to the shared uniform so the shader can
+          // orient normals for lighting (used by both the cube and the gizmo).
+          device.queue.writeBuffer(modelUniform, 0, model);
 
           // Cache the transforms for the pick/grab handlers + occlusion test.
           // invViewProj turns a screen pixel into a world-space picking ray.
@@ -784,15 +919,23 @@ export default function App() {
             cam: [panXRef.current, panYRef.current, distanceRef.current],
           };
 
-          // Rebuild the cube's vertex buffer when a gizmo drag moved a corner,
-          // so the dragged vertex reshapes the faces that share it.
-          if (dirtyCubeRef.current) {
-            device.queue.writeBuffer(
-              vertexBuffer,
-              0,
-              buildCubeDataFromCorners(cornersRef.current),
-            );
-            dirtyCubeRef.current = false;
+          // Rebuild the mesh vertex buffer when vertices moved or faces were
+          // added (extrude).  If the structure changed, the new data may be
+          // larger than the current buffer, so reallocate if needed.
+          if (dirtyMeshRef.current || meshStructureDirtyRef.current) {
+            const data = buildMeshData(meshRef.current);
+            if (meshStructureDirtyRef.current) {
+              if (data.byteLength > vertexBuffer.size) {
+                vertexBuffer.destroy();
+                vertexBuffer = device.createBuffer({
+                  size: data.byteLength,
+                  usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+                });
+              }
+              meshStructureDirtyRef.current = false;
+            }
+            device.queue.writeBuffer(vertexBuffer, 0, data);
+            dirtyMeshRef.current = false;
           }
 
           const encoder = device.createCommandEncoder();
@@ -815,7 +958,10 @@ export default function App() {
           pass.setPipeline(pipeline);
           pass.setBindGroup(0, bindGroup);
           pass.setVertexBuffer(0, vertexBuffer);
-          pass.draw(36);
+          // Total vertices = Σ (corners−1)×3 over all faces (triangle fan).
+          let drawCount = 0;
+          for (const f of meshRef.current.faces) drawCount += (f.corners.length - 1) * 3;
+          pass.draw(drawCount);
 
           // Translation gizmo: when a vertex or face is selected, draw the three
           // axis arrows anchored on the selection's centre. The arrows live in
@@ -840,7 +986,7 @@ export default function App() {
         }
 
         setStatus(
-          "WebGPU running — drag to rotate · shift+drag to pan · scroll to zoom · click to select a vertex or face (V / F) · drag a gizmo arrow to move it ✦",
+          "WebGPU running — drag to rotate · shift+drag to pan · scroll to zoom · click to select a vertex or face (V / F) · E to extrude a face · drag a gizmo arrow to move it ✦",
         );
         frame = requestAnimationFrame(render);
       } catch (err) {

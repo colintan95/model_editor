@@ -6,17 +6,25 @@ export type Vec3 = [number, number, number];
 
 export interface Face {
   color: [number, number, number, number];
+  // Outward unit normal of the (axis-aligned) face, in the cube's local space.
+  normal: Vec3;
   verts: Vec3[];
 }
 
 const HALF = 0.5;
 
-// 6 faces × 2 triangles × 3 vertices = 36 vertices, coloured per face.
-// Interleaved layout per vertex: [x, y, z, r, g, b, a] → stride 28 bytes.
+// Every face shares one flat grey; the faces are told apart by the lighting
+// (their normals catch a fixed directional light differently), not by colour.
+const GREY: [number, number, number, number] = [0.75, 0.75, 0.75, 1.0];
+
+// 6 faces × 2 triangles × 3 vertices = 36 vertices. Each face is flat grey but
+// carries its own normal so the shader can shade it.
+// Interleaved layout per vertex: [x, y, z, nx, ny, nz, r, g, b, a] → 40 bytes.
 export const FACES: Face[] = [
   {
     // +Z (front)
-    color: [1.0, 0.12, 0.12, 1.0],
+    color: GREY,
+    normal: [0, 0, 1],
     verts: [
       [-HALF, -HALF, HALF], [HALF, -HALF, HALF], [HALF, HALF, HALF],
       [-HALF, -HALF, HALF], [HALF, HALF, HALF], [-HALF, HALF, HALF],
@@ -24,7 +32,8 @@ export const FACES: Face[] = [
   },
   {
     // -Z (back)
-    color: [0.12, 1.0, 0.12, 1.0],
+    color: GREY,
+    normal: [0, 0, -1],
     verts: [
       [HALF, -HALF, -HALF], [-HALF, -HALF, -HALF], [-HALF, HALF, -HALF],
       [HALF, -HALF, -HALF], [-HALF, HALF, -HALF], [HALF, HALF, -HALF],
@@ -32,7 +41,8 @@ export const FACES: Face[] = [
   },
   {
     // +Y (top)
-    color: [0.2, 0.4, 1.0, 1.0],
+    color: GREY,
+    normal: [0, 1, 0],
     verts: [
       [-HALF, HALF, HALF], [HALF, HALF, HALF], [HALF, HALF, -HALF],
       [-HALF, HALF, HALF], [HALF, HALF, -HALF], [-HALF, HALF, -HALF],
@@ -40,7 +50,8 @@ export const FACES: Face[] = [
   },
   {
     // -Y (bottom)
-    color: [1.0, 0.85, 0.1, 1.0],
+    color: GREY,
+    normal: [0, -1, 0],
     verts: [
       [-HALF, -HALF, -HALF], [HALF, -HALF, -HALF], [HALF, -HALF, HALF],
       [-HALF, -HALF, -HALF], [HALF, -HALF, HALF], [-HALF, -HALF, HALF],
@@ -48,7 +59,8 @@ export const FACES: Face[] = [
   },
   {
     // +X (right)
-    color: [0.1, 0.9, 0.9, 1.0],
+    color: GREY,
+    normal: [1, 0, 0],
     verts: [
       [HALF, -HALF, HALF], [HALF, -HALF, -HALF], [HALF, HALF, -HALF],
       [HALF, -HALF, HALF], [HALF, HALF, -HALF], [HALF, HALF, HALF],
@@ -56,7 +68,8 @@ export const FACES: Face[] = [
   },
   {
     // -X (left)
-    color: [0.9, 0.2, 0.95, 1.0],
+    color: GREY,
+    normal: [-1, 0, 0],
     verts: [
       [-HALF, -HALF, -HALF], [-HALF, -HALF, HALF], [-HALF, HALF, HALF],
       [-HALF, -HALF, -HALF], [-HALF, HALF, HALF], [-HALF, HALF, -HALF],
@@ -65,8 +78,8 @@ export const FACES: Face[] = [
 ];
 
 export const VERTICES_PER_FACE = 6;
-export const FLOATS_PER_VERTEX = 7; // xyz + rgba
-export const BYTE_STRIDE = FLOATS_PER_VERTEX * 4; // 28
+export const FLOATS_PER_VERTEX = 10; // xyz + nrm + rgba
+export const BYTE_STRIDE = FLOATS_PER_VERTEX * 4; // 40
 
 export function buildCubeData(): Float32Array<ArrayBuffer> {
   const data = new Float32Array(FACES.length * VERTICES_PER_FACE * FLOATS_PER_VERTEX);
@@ -76,6 +89,9 @@ export function buildCubeData(): Float32Array<ArrayBuffer> {
       data[i++] = v[0];
       data[i++] = v[1];
       data[i++] = v[2];
+      data[i++] = face.normal[0];
+      data[i++] = face.normal[1];
+      data[i++] = face.normal[2];
       data[i++] = face.color[0];
       data[i++] = face.color[1];
       data[i++] = face.color[2];
@@ -124,6 +140,9 @@ export function buildCubeDataFromCorners(
       data[i++] = c[0];
       data[i++] = c[1];
       data[i++] = c[2];
+      data[i++] = face.normal[0];
+      data[i++] = face.normal[1];
+      data[i++] = face.normal[2];
       data[i++] = face.color[0];
       data[i++] = face.color[1];
       data[i++] = face.color[2];
@@ -532,13 +551,18 @@ export function rayCapsule(
 
 const ARROW_SHAFT_LEN = 0.3;
 const ARROW_CONE_LEN = 0.085;
-const ARROW_SHAFT_R = 0.016;
-const ARROW_CONE_R = 0.045;
+// Shaft and cone radii — arrow thickness, 1.5× the thinnest setting.
+const ARROW_SHAFT_R = 0.012;
+const ARROW_CONE_R = 0.03375;
 const ARROW_SEGMENTS = 8;
+
+// Uniform scale of the whole gizmo — applied to the arrow geometry (below) and
+// exported so the hit-test target in App.tsx grows with it. 1.0 = original size.
+export const GIZMO_SCALE = 1.5;
 
 // Total length from an arrow's base to its tip. Used to place the heads and to
 // sample points along the shafts when hit-testing a gizmo grab.
-export const GIZMO_TIP_DIST = ARROW_SHAFT_LEN + ARROW_CONE_LEN;
+export const GIZMO_TIP_DIST = (ARROW_SHAFT_LEN + ARROW_CONE_LEN) * GIZMO_SCALE;
 
 export const AXIS_DIRS: Vec3[] = [
   [1, 0, 0],
@@ -570,24 +594,26 @@ function normalize(a: Vec3): Vec3 {
 // the model by post-multiplying the gizmo MVP with a translation.
 export function buildArrows(): Float32Array<ArrayBuffer> {
   // Solid-of-revolution profile: (radius, position-along-axis). A flat shaft,
-  // then a flared cone that comes to a point.
+  // then a flared cone that comes to a point. The whole gizmo is scaled up by
+  // GIZMO_SCALE (length and thickness together) so it reads clearly on the cube.
   const rings: [number, number][] = [
-    [ARROW_SHAFT_R, 0],
-    [ARROW_SHAFT_R, ARROW_SHAFT_LEN],
-    [ARROW_CONE_R, ARROW_SHAFT_LEN],
-    [0, ARROW_SHAFT_LEN + ARROW_CONE_LEN],
+    [ARROW_SHAFT_R * GIZMO_SCALE, 0],
+    [ARROW_SHAFT_R * GIZMO_SCALE, ARROW_SHAFT_LEN * GIZMO_SCALE],
+    [ARROW_CONE_R * GIZMO_SCALE, ARROW_SHAFT_LEN * GIZMO_SCALE],
+    [0, GIZMO_TIP_DIST],
   ];
 
   const out: number[] = [];
 
-  // Append one xyz + rgba vertex.
+  // Append one xyz + nrm + rgba vertex.
   const vert = (
     x: number,
     y: number,
     z: number,
+    nrm: Vec3,
     c: [number, number, number, number],
   ) => {
-    out.push(x, y, z, c[0], c[1], c[2], c[3]);
+    out.push(x, y, z, nrm[0], nrm[1], nrm[2], c[0], c[1], c[2], c[3]);
   };
 
   for (let a = 0; a < AXIS_DIRS.length; a++) {
@@ -615,13 +641,30 @@ export function buildArrows(): Float32Array<ArrayBuffer> {
       ];
     };
 
+    // The outward normal of ring `ringIdx` at angular slot `seg`: radial for the
+    // curved sides, the axis direction at the pointed tip, and -axis for the flat
+    // cap that rests on the vertex.
+    const capNormal: Vec3 = [-dir[0], -dir[1], -dir[2]];
+    const ringNormal = (ringIdx: number, seg: number): Vec3 => {
+      const [r] = rings[ringIdx];
+      if (r < 1e-6) return [dir[0], dir[1], dir[2]]; // apex → +axis
+      const ang = (seg / n) * Math.PI * 2;
+      const ca = Math.cos(ang);
+      const sa = Math.sin(ang);
+      return [
+        u[0] * ca + v[0] * sa,
+        u[1] * ca + v[1] * sa,
+        u[2] * ca + v[2] * sa,
+      ];
+    };
+
     // Base cap: a fan at ring 0 closing the shaft end that rests on the vertex.
     for (let s = 0; s < n; s++) {
       const p0 = ringVertex(0, s);
       const p1 = ringVertex(0, s + 1);
-      vert(0, 0, 0, color);
-      vert(p0[0], p0[1], p0[2], color);
-      vert(p1[0], p1[1], p1[2], color);
+      vert(0, 0, 0, capNormal, color);
+      vert(p0[0], p0[1], p0[2], capNormal, color);
+      vert(p1[0], p1[1], p1[2], capNormal, color);
     }
 
     // Side bands connecting consecutive rings (shaft, then the flared cone).
@@ -631,15 +674,176 @@ export function buildArrows(): Float32Array<ArrayBuffer> {
         const a1 = ringVertex(i, s + 1);
         const b0 = ringVertex(i + 1, s);
         const b1 = ringVertex(i + 1, s + 1);
-        vert(a0[0], a0[1], a0[2], color);
-        vert(a1[0], a1[1], a1[2], color);
-        vert(b1[0], b1[1], b1[2], color);
-        vert(a0[0], a0[1], a0[2], color);
-        vert(b1[0], b1[1], b1[2], color);
-        vert(b0[0], b0[1], b0[2], color);
+        vert(a0[0], a0[1], a0[2], ringNormal(i, s), color);
+        vert(a1[0], a1[1], a1[2], ringNormal(i, s + 1), color);
+        vert(b1[0], b1[1], b1[2], ringNormal(i + 1, s + 1), color);
+        vert(a0[0], a0[1], a0[2], ringNormal(i, s), color);
+        vert(b1[0], b1[1], b1[2], ringNormal(i + 1, s + 1), color);
+        vert(b0[0], b0[1], b0[2], ringNormal(i + 1, s), color);
       }
     }
   }
 
   return new Float32Array(out);
+}
+
+// ── Dynamic mesh (supports extrude) ──
+// A mesh is a list of vertex positions and a list of faces (each an n-gon of
+// vertex indices with a shared normal + colour).  The default mesh is the unit
+// cube; extrudeFace() grows it by adding new vertices and side/cap faces.
+
+export interface DynFace {
+  normal: Vec3;
+  color: [number, number, number, number];
+  corners: number[]; // vertex indices, CCW from outside
+}
+
+export interface DynMesh {
+  verts: Vec3[];
+  faces: DynFace[];
+}
+
+// Create the default unit-cube mesh (8 verts, 6 quad faces).
+export function defaultMesh(): DynMesh {
+  const verts = CORNERS.map((c) => [c[0], c[1], c[2]] as Vec3);
+  const faces: DynFace[] = FACES.map((f, i) => ({
+    normal: f.normal,
+    color: f.color,
+    corners: FACE_CORNERS[i],
+  }));
+  return { verts, faces };
+}
+
+// Build interleaved GPU vertex data from a dynamic mesh.  Each face is drawn as
+// a triangle fan (v0,v1,v2 … v0,vn-2,vn-1), producing (n-1)×3 vertices.
+export function buildMeshData(mesh: DynMesh): Float32Array<ArrayBuffer> {
+  // Pre-count total vertices to size the buffer.
+  let totalVerts = 0;
+  for (const f of mesh.faces) totalVerts += (f.corners.length - 1) * 3;
+  const data = new Float32Array(totalVerts * FLOATS_PER_VERTEX);
+  let i = 0;
+  for (const face of mesh.faces) {
+    const cs = face.corners;
+    for (let j = 1; j < cs.length - 1; j++) {
+      for (const ci of [cs[0], cs[j], cs[j + 1]]) {
+        const v = mesh.verts[ci];
+        data[i++] = v[0];
+        data[i++] = v[1];
+        data[i++] = v[2];
+        data[i++] = face.normal[0];
+        data[i++] = face.normal[1];
+        data[i++] = face.normal[2];
+        data[i++] = face.color[0];
+        data[i++] = face.color[1];
+        data[i++] = face.color[2];
+        data[i++] = face.color[3];
+      }
+    }
+  }
+  return data;
+}
+
+// Centroid of a face (average of its corner positions).
+export function faceCentroid(mesh: DynMesh, faceIdx: number): Vec3 {
+  const f = mesh.faces[faceIdx];
+  let x = 0, y = 0, z = 0;
+  for (const ci of f.corners) {
+    x += mesh.verts[ci][0];
+    y += mesh.verts[ci][1];
+    z += mesh.verts[ci][2];
+  }
+  const n = f.corners.length;
+  return [x / n, y / n, z / n];
+}
+
+// ── Extrude ──
+// Push the selected face outward along its normal by `dist`, creating 4 new
+// vertices, (n) side walls, and 1 cap face.  Returns the index of the new cap.
+export function extrudeFace(
+  mesh: DynMesh,
+  faceIdx: number,
+  dist: number,
+): number {
+  const face = mesh.faces[faceIdx];
+  const N = face.normal;
+  const old = face.corners;
+  const n = old.length;
+
+  // Clone the 4 (or n) corners outward.
+  const nw: number[] = [];
+  for (const ci of old) {
+    const v = mesh.verts[ci];
+    const nv: Vec3 = [v[0] + N[0] * dist, v[1] + N[1] * dist, v[2] + N[2] * dist];
+    nw.push(mesh.verts.push(nv) - 1);
+  }
+
+  // Side walls: for each edge (old[i] → old[i+1]) make a quad to the new ring.
+  for (let i = 0; i < n; i++) {
+    const a = old[i];
+    const b = old[(i + 1) % n];
+    const na = nw[i];
+    const nb = nw[(i + 1) % n];
+    // Outward normal = cross(edge, extrudeDir) normalised.
+    const va = mesh.verts[a];
+    const e: Vec3 = [
+      mesh.verts[b][0] - va[0],
+      mesh.verts[b][1] - va[1],
+      mesh.verts[b][2] - va[2],
+    ];
+    const cn: Vec3 = [
+      e[1] * N[2] - e[2] * N[1],
+      e[2] * N[0] - e[0] * N[2],
+      e[0] * N[1] - e[1] * N[0],
+    ];
+    const len = Math.hypot(cn[0], cn[1], cn[2]) || 1;
+    mesh.faces.push({
+      normal: [cn[0] / len, cn[1] / len, cn[2] / len],
+      color: face.color,
+      corners: [a, b, nb, na],
+    });
+  }
+
+  // Cap face at the new ring.
+  mesh.faces.push({ normal: N, color: face.color, corners: nw });
+  return mesh.faces.length - 1;
+}
+
+// ── Ray vs. convex polygon (triangle-fan) for face picking ──
+export function rayPoly(
+  ox: number, oy: number, oz: number,
+  dx: number, dy: number, dz: number,
+  pts: Vec3[],
+): number | null {
+  let best = Infinity;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const t = rayTri(ox, oy, oz, dx, dy, dz, pts[0], pts[i], pts[i + 1]);
+    if (t !== null && t < best) best = t;
+  }
+  return best < Infinity ? best : null;
+}
+
+// Møller–Trumbore ray–triangle intersection; returns t > 0 or null.
+function rayTri(
+  ox: number, oy: number, oz: number,
+  dx: number, dy: number, dz: number,
+  p0: Vec3, p1: Vec3, p2: Vec3,
+): number | null {
+  const e1x = p1[0] - p0[0], e1y = p1[1] - p0[1], e1z = p1[2] - p0[2];
+  const e2x = p2[0] - p0[0], e2y = p2[1] - p0[1], e2z = p2[2] - p0[2];
+  const hx = dy * e2z - dz * e2y;
+  const hy = dz * e2x - dx * e2z;
+  const hz = dx * e2y - dy * e2x;
+  const det = e1x * hx + e1y * hy + e1z * hz;
+  if (Math.abs(det) < 1e-12) return null;
+  const inv = 1 / det;
+  const sx = ox - p0[0], sy = oy - p0[1], sz = oz - p0[2];
+  const u = (sx * hx + sy * hy + sz * hz) * inv;
+  if (u < 0 || u > 1) return null;
+  const qx = sy * e1z - sz * e1y;
+  const qy = sz * e1x - sx * e1z;
+  const qz = sx * e1y - sy * e1x;
+  const v = (dx * qx + dy * qy + dz * qz) * inv;
+  if (v < 0 || u + v > 1) return null;
+  const t = (e2x * qx + e2y * qy + e2z * qz) * inv;
+  return t > 1e-9 ? t : null;
 }
