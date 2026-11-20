@@ -20,7 +20,11 @@ import {
   rayFromCursor,
   raySphere,
   rayCapsule,
+  FACE_CORNERS,
+  centroidOf,
+  faceFromSurfacePoint,
 } from "./geometry";
+import type { Vec3 } from "./geometry";
 
 // ── WGSL shader ─────────────────────────────────────────────────────────────
 // A vertex buffer supplies a position (vec3) and a color (vec4) per vertex.
@@ -63,6 +67,12 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
 
+  // Editing mode: select + move a single vertex, or a whole face (its 4
+  // corners together). Switching modes clears the other kind of selection.
+  const [mode, setMode] = useState<"vertex" | "face">("vertex");
+  // Face currently selected in face mode (null = none).
+  const [faceSel, setFaceSel] = useState<number | null>(null);
+
   // Live, mutable rotation state shared between the drag handlers and the
   // render loop without forcing a re-render (or restarting the effect).
   const yawRef = useRef(0.6);
@@ -81,17 +91,28 @@ export default function App() {
   const cornersRef = useRef(defaultCorners());
   // Set while a corner has moved, so the cube's GPU buffer gets rebuilt.
   const dirtyCubeRef = useRef(false);
-  // Active gizmo drag: which corner, and which local axis it is sliding along.
-  // `axis` is locked the moment the gizmo is grabbed (ray-cast), so it never
-  // changes for the duration of the drag.
+  // Active gizmo drag: which corners (one for a vertex, four for a face) and
+  // which local axis they are sliding along. `axis` is locked the moment the
+  // gizmo is grabbed (ray-cast), so it never changes for the duration of the
+  // drag.
   const gizmoDragRef = useRef<{
-    idx: number;
+    // Corner indices the drag slides (one for a vertex, four for a face).
+    // `axis` is locked the moment the gizmo is grabbed (ray-cast), so it never
+    // changes for the duration of the drag.
+    corners: number[];
     axis: [number, number, number];
   } | null>(null);
 
   // Which corner is currently selected (-1 / null = none). A ref so the render
   // loop + overlay reader always see the latest value without a re-render.
   const selectedRef = useRef<number | null>(null);
+
+  // Mirror of `mode` so the drag handlers + render loop read the latest value
+  // without a re-render.
+  const modeRef = useRef<"vertex" | "face">("vertex");
+  // Face currently selected (null = none) — the face-mode analogue of
+  // selectedRef, read by the handlers/render loop without a re-render.
+  const faceSelRef = useRef<number | null>(null);
 
   // The most recent camera transforms, captured each frame so that click
   // handlers (which fire between frames) and the overlay use consistent maths.
@@ -102,10 +123,25 @@ export default function App() {
     cam: [number, number, number];
   } | null>(null);
 
-  // Deselect on Escape / click a Clear button.
+  // Mode switching (V / F) and deselect on Escape / Clear.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      const k = e.key.toLowerCase();
       if (e.key === "Escape") {
+        selectedRef.current = null;
+        setSelected(null);
+        faceSelRef.current = null;
+        setFaceSel(null);
+        return;
+      }
+      if (k === "v") {
+        modeRef.current = "vertex";
+        setMode("vertex");
+        faceSelRef.current = null;
+        setFaceSel(null);
+      } else if (k === "f") {
+        modeRef.current = "face";
+        setMode("face");
         selectedRef.current = null;
         setSelected(null);
       }
@@ -271,9 +307,64 @@ export default function App() {
           },
         });
 
+        // A second pipeline for the gizmo that disables depth testing so the
+        // arrows always render on top of the cube — visible even when they
+        // intersect or pass behind the geometry.
+        const gizmoPipeline = device.createRenderPipeline({
+          layout: device.createPipelineLayout({
+            bindGroupLayouts: [bindGroupLayout],
+          }),
+          vertex: {
+            module: shaderModule,
+            entryPoint: "vertexMain",
+            buffers: [
+              {
+                arrayStride: BYTE_STRIDE,
+                attributes: [
+                  { shaderLocation: 0, offset: 0, format: "float32x3" },
+                  { shaderLocation: 1, offset: 12, format: "float32x4" },
+                ],
+              },
+            ],
+          },
+          fragment: {
+            module: shaderModule,
+            entryPoint: "fragmentMain",
+            targets: [{ format }],
+          },
+          primitive: {
+            topology: "triangle-list",
+          },
+          depthStencil: {
+            format: "depth24plus",
+            depthWriteEnabled: false,
+            depthCompare: "always",
+          },
+        });
+
         // 5. Camera control: plain drag rotates, shift+drag pans, wheel zooms.
         // (Pointer events cover mouse + touch + pen.)
         const FOV = (60 * Math.PI) / 180; // shared by the projection + pan maths
+
+        // ── Selection helpers (vertex or face, by mode) ────────────────
+        // Corner indices the *current* selection covers: one for a vertex, its
+        // four for a face. null when nothing is selected in this mode.
+        const selectedCornerIndices = (): number[] | null => {
+          if (modeRef.current === "face") {
+            const f = faceSelRef.current;
+            return f === null ? null : FACE_CORNERS[f];
+          }
+          const v = selectedRef.current;
+          return v === null ? null : [v];
+        };
+        // Local-space centre of the current selection — the gizmo's anchor
+        // (the corner itself for a vertex, the face's centre for a face).
+        const selectedCentroid = (): Vec3 | null => {
+          const idxs = selectedCornerIndices();
+          return idxs ? centroidOf(idxs, cornersRef.current) : null;
+        };
+        // Anything selected in the active mode?
+        const hasSelection = (): boolean => selectedCornerIndices() !== null;
 
         // Pick the corner the cursor's ray passes closest to. The ray is built in
         // world space from the inverse of (proj·view), then rotated into the cube's
@@ -293,13 +384,36 @@ export default function App() {
             rect.height,
           );
           if (!ray) return;
-          // Rotate the world ray into local space.
+          // Rotate the world ray into the cube's local space.
           const lo = transform4(st.invModel, ray.ox, ray.oy, ray.oz, 1);
           const ld = transform4(st.invModel, ray.dx, ray.dy, ray.dz, 0);
           const ldLen = Math.hypot(ld[0], ld[1], ld[2]) || 1;
           const ldx = ld[0] / ldLen;
           const ldy = ld[1] / ldLen;
           const ldz = ld[2] / ldLen;
+
+          // ── Face mode: select the face the ray first enters the cube
+          // through. The near-intersection point's coordinate nearest the ±0.5
+          // shell names the face; a miss deselects. ──
+          if (modeRef.current === "face") {
+            const tCube = rayCubeNearT(lo[0], lo[1], lo[2], ldx, ldy, ldz);
+            if (tCube === null) {
+              faceSelRef.current = null;
+              setFaceSel(null);
+              return;
+            }
+            const f = faceFromSurfacePoint(
+              lo[0] + ldx * tCube,
+              lo[1] + ldy * tCube,
+              lo[2] + ldz * tCube,
+            );
+            faceSelRef.current = f;
+            setFaceSel(f);
+            return;
+          }
+
+          // ── Vertex mode: the nearest corner the ray passes by, skipping any
+          // hidden behind a face. ──
           // A constant *screen* grab target: convert the pixel radius to local
           // units (model has no scale, so local units == world units here).
           const worldPerPx =
@@ -360,8 +474,7 @@ export default function App() {
         const GRAB_RADIUS = 0.07; // local/world units — constant in 3D by design
         const grabGizmo = (clientX: number, clientY: number): number => {
           const st = frameRef.current;
-          const idx = selectedRef.current;
-          if (!st || !st.invViewProj || idx === null) return -1;
+          if (!st || !st.invViewProj || !hasSelection()) return -1;
           const rect = el.getBoundingClientRect();
           const ray = rayFromCursor(
             st.invViewProj,
@@ -378,7 +491,11 @@ export default function App() {
           const ldx = ld[0] / ldLen;
           const ldy = ld[1] / ldLen;
           const ldz = ld[2] / ldLen;
-          const c = cornersRef.current[idx];
+          // Anchor the three arrows on the selection's centre (the corner for a
+          // vertex, the face's centre for a face) so the same grab works for
+          // both modes.
+          const c = selectedCentroid();
+          if (!c) return -1;
           let bestAxis = -1;
           let bestT = Infinity;
           for (let a = 0; a < AXIS_DIRS.length; a++) {
@@ -412,10 +529,13 @@ export default function App() {
           // which is locked for the whole drag.
           const grabAxis = grabGizmo(e.clientX, e.clientY);
           if (grabAxis >= 0) {
-            gizmoDragRef.current = {
-              idx: selectedRef.current as number,
-              axis: AXIS_DIRS[grabAxis],
-            };
+            const corners = selectedCornerIndices();
+            if (corners) {
+              gizmoDragRef.current = {
+                corners,
+                axis: AXIS_DIRS[grabAxis],
+              };
+            }
           }
           canvas.setPointerCapture(e.pointerId);
         };
@@ -437,14 +557,24 @@ export default function App() {
           if (g && st) {
             const dx = e.clientX - lastPointerRef.current.x;
             const dy = e.clientY - lastPointerRef.current.y;
-            const s = screenAxis(st, cornersRef.current[g.idx], g.axis);
+            // Project the locked local axis to screen from the *current* centre
+            // of the moving corners, so the drag tracks the handle as it moves.
+            const s = screenAxis(
+              st,
+              centroidOf(g.corners, cornersRef.current),
+              g.axis,
+            );
             const len2 = s[0] * s[0] + s[1] * s[1];
             if (len2 > 1e-6) {
               const t = (dx * s[0] + dy * s[1]) / len2;
-              const c = cornersRef.current[g.idx];
-              c[0] = Math.max(-1.5, Math.min(1.5, c[0] + g.axis[0] * t));
-              c[1] = Math.max(-1.5, Math.min(1.5, c[1] + g.axis[1] * t));
-              c[2] = Math.max(-1.5, Math.min(1.5, c[2] + g.axis[2] * t));
+              // Slide every corner of the handle along the locked axis, clamped
+              // to the same box a single vertex respects.
+              for (const ci of g.corners) {
+                const c = cornersRef.current[ci];
+                c[0] = Math.max(-1.5, Math.min(1.5, c[0] + g.axis[0] * t));
+                c[1] = Math.max(-1.5, Math.min(1.5, c[1] + g.axis[1] * t));
+                c[2] = Math.max(-1.5, Math.min(1.5, c[2] + g.axis[2] * t));
+              }
               dirtyCubeRef.current = true;
             }
             lastPointerRef.current = { x: e.clientX, y: e.clientY };
@@ -539,11 +669,64 @@ export default function App() {
         // Each frame: clear, then — if a vertex is selected and currently
         // visible (in front of the camera and not behind a face) — paint a
         // marker at its projected screen position.
+        // Project a local point to CSS-pixel screen coords (non-null overlay).
+        const project = (
+          st: NonNullable<typeof frameRef.current>,
+          c: readonly number[],
+        ): [number, number, boolean] => {
+          const clip = transform4(st.mvp, c[0], c[1], c[2], 1);
+          const inFront = clip[3] > 0;
+          const px = (clip[0] / clip[3] * 0.5 + 0.5) * overlay!.width;
+          const py = (1 - (clip[1] / clip[3] * 0.5 + 0.5)) * overlay!.height;
+          return [px, py, inFront];
+        };
+
         function drawOverlay() {
           octx!.clearRect(0, 0, overlay!.width, overlay!.height);
-          const idx = selectedRef.current;
           const st = frameRef.current;
-          if (idx === null || !st) {
+          if (!st) {
+            if (statusSpanRef.current)
+              statusSpanRef.current.textContent =
+                modeRef.current === "face"
+                  ? "no face selected"
+                  : "no vertex selected";
+            return;
+          }
+
+          // ── Face mode: outline the selected face's quad. ──
+          if (modeRef.current === "face") {
+            const f = faceSelRef.current;
+            if (f === null) {
+              if (statusSpanRef.current)
+                statusSpanRef.current.textContent = "no face selected";
+              return;
+            }
+            const dpr = window.devicePixelRatio || 1;
+            const pts = FACE_CORNERS[f].map((ci) =>
+              project(st, cornersRef.current[ci]),
+            );
+            const allFront = pts.every((p) => p[2]);
+            if (statusSpanRef.current)
+              statusSpanRef.current.textContent = allFront
+                ? `face ${f} · visible`
+                : `face ${f} · back-facing (no highlight)`;
+            if (!allFront) return;
+            octx!.beginPath();
+            pts.forEach((p, i) =>
+              i === 0 ? octx!.moveTo(p[0], p[1]) : octx!.lineTo(p[0], p[1]),
+            );
+            octx!.closePath();
+            octx!.fillStyle = "rgba(80,200,255,0.25)";
+            octx!.fill();
+            octx!.strokeStyle = "rgba(150,235,255,0.95)";
+            octx!.lineWidth = 1.5 * dpr;
+            octx!.stroke();
+            return;
+          }
+
+          // ── Vertex mode: a dot on the selected corner. ──
+          const idx = selectedRef.current;
+          if (idx === null) {
             if (statusSpanRef.current)
               statusSpanRef.current.textContent = "no vertex selected";
             return;
@@ -634,16 +817,16 @@ export default function App() {
           pass.setVertexBuffer(0, vertexBuffer);
           pass.draw(36);
 
-          // Vertex translation gizmo: when a vertex is selected, draw the three
-          // axis arrows anchored on that corner. The arrows live in the cube's
-          // local space, so post-multiplying the cube's MVP by a translation to
-          // the corner places them on the vertex and lets them rotate with the
-          // cube. (Dragging is not wired up yet — this is the visual handle.)
-          const sel = selectedRef.current;
-          if (sel !== null) {
-            const c = cornersRef.current[sel];
+          // Translation gizmo: when a vertex or face is selected, draw the three
+          // axis arrows anchored on the selection's centre. The arrows live in
+          // the cube's local space, so post-multiplying the cube's MVP by a
+          // translation to that centre places them on the handle and lets them
+          // rotate with the cube.
+          if (hasSelection()) {
+            const c = selectedCentroid()!;
             const gizmoMVP = multiply(mvp, translation(c[0], c[1], c[2]));
             device.queue.writeBuffer(gizmoUniform, 0, gizmoMVP);
+            pass.setPipeline(gizmoPipeline);
             pass.setBindGroup(0, gizmoBindGroup);
             pass.setVertexBuffer(0, arrowBuffer);
             pass.draw(arrowCount);
@@ -657,7 +840,7 @@ export default function App() {
         }
 
         setStatus(
-          "WebGPU running — drag to rotate · shift+drag to pan · scroll to zoom · click a corner to select · drag a gizmo arrow to move it ✦",
+          "WebGPU running — drag to rotate · shift+drag to pan · scroll to zoom · click to select a vertex or face (V / F) · drag a gizmo arrow to move it ✦",
         );
         frame = requestAnimationFrame(render);
       } catch (err) {
@@ -698,16 +881,55 @@ export default function App() {
         />
       </div>
 
-      <div className="mt-4 flex items-center gap-3 text-sm text-gray-400 max-w-md text-center">
+      {/* Mode toggle: choose what click-selection targets. */}
+      <div className="mt-4 flex items-center gap-1 text-sm">
+        <span className="text-gray-500 mr-1">mode</span>
+        <button
+          type="button"
+          onClick={() => {
+            modeRef.current = "vertex";
+            setMode("vertex");
+            faceSelRef.current = null;
+            setFaceSel(null);
+          }}
+          className={
+            "rounded-md border px-3 py-1 text-xs transition " +
+            (mode === "vertex"
+              ? "border-sky-400 bg-sky-500/20 text-sky-300"
+              : "border-white/15 text-gray-300 hover:bg-white/10")
+          }
+        >
+          Vertex
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            modeRef.current = "face";
+            setMode("face");
+            selectedRef.current = null;
+            setSelected(null);
+          }}
+          className={
+            "rounded-md border px-3 py-1 text-xs transition " +
+            (mode === "face"
+              ? "border-sky-400 bg-sky-500/20 text-sky-300"
+              : "border-white/15 text-gray-300 hover:bg-white/10")
+          }
+        >
+          Face
+        </button>
+      </div>
+
+      <div className="mt-3 flex items-center gap-3 text-sm text-gray-400 max-w-md text-center">
         <span className="inline-flex items-center gap-1.5">
-          <span className="text-sky-400 font-semibold tabular-nums">
-            vertex
+          <span className="text-sky-400 font-semibold tabular-nums capitalize">
+            {mode}
           </span>
           <span
             ref={statusSpanRef}
             className="text-gray-300 tabular-nums"
           >
-            no vertex selected
+            {mode === "face" ? "no face selected" : "no vertex selected"}
           </span>
         </span>
         <button
@@ -715,8 +937,10 @@ export default function App() {
           onClick={() => {
             selectedRef.current = null;
             setSelected(null);
+            faceSelRef.current = null;
+            setFaceSel(null);
           }}
-          disabled={selected === null}
+          disabled={selected === null && faceSel === null}
           className="rounded-md border border-white/15 px-2 py-0.5 text-xs text-gray-300 hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed"
         >
           Clear

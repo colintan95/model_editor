@@ -133,6 +133,59 @@ export function buildCubeDataFromCorners(
   return data;
 }
 
+// ── Face selection helpers ─────────────────────────────────────────────────
+// Faces are the 6 quads in FACES. Each is identified by its 4 unique corners
+// (derived here so the two definitions cannot drift apart) and, for hit
+// testing, by the coordinate of its surface point nearest the ±0.5 shell.
+
+// The 4 corner indices that make up each face. Moving a face slides all four of
+// these together, the same way the gizmo slides a single vertex corner.
+export function faceCornerIndices(): number[][] {
+  const out: number[][] = [];
+  for (const face of FACES) {
+    const seen: number[] = [];
+    for (const v of face.verts) {
+      const ci = matchCorner(v);
+      if (!seen.includes(ci)) seen.push(ci);
+    }
+    out.push(seen);
+  }
+  return out;
+}
+
+// Average position of the given corners — the anchor a gizmo sits on. A
+// single-vertex selection yields that vertex; a face yields its centre.
+export function centroidOf(indices: readonly number[], corners: Vec3[]): Vec3 {
+  let x = 0;
+  let y = 0;
+  let z = 0;
+  for (const i of indices) {
+    const c = corners[i];
+    x += c[0];
+    y += c[1];
+    z += c[2];
+  }
+  const n = indices.length || 1;
+  return [x / n, y / n, z / n];
+}
+
+// Which of the 6 faces does a point on the cube's surface belong to? The point
+// is expected to sit on the axis-aligned box [-0.5, 0.5]^3 (e.g. a ray/cube
+// near-intersection). The coordinate whose |value| is closest to 0.5 names the
+// face, and its sign picks the + / − side. Mirrors the FACES order exactly.
+export function faceFromSurfacePoint(
+  px: number,
+  py: number,
+  pz: number,
+): number {
+  const ax = Math.abs(px);
+  const ay = Math.abs(py);
+  const az = Math.abs(pz);
+  if (az >= ax && az >= ay) return pz >= 0 ? 0 : 1; // +Z / -Z
+  if (ay >= ax && ay >= az) return py >= 0 ? 2 : 3; // +Y / -Y
+  return px >= 0 ? 4 : 5; // +X / -X
+}
+
 export function perspective(
   fovy: number,
   aspect: number,
@@ -217,6 +270,11 @@ export const CORNERS: Vec3[] = [
   [HALF, HALF, HALF],
   [-HALF, HALF, HALF],
 ];
+
+// The 4 corner indices per face. Computed here (after CORNERS exists) because
+// faceCornerIndices() walks CORNERS, so this must initialise after the array
+// above or it hits a temporal-dead-zone error at module load.
+export const FACE_CORNERS: number[][] = faceCornerIndices();
 
 // Transform a homogeneous point by a column-major 4×4 matrix.
 // out_row = Σ_col m[col*4 + row] * v[col]  (matches the multiply() convention).
