@@ -16,6 +16,10 @@ import {
   GIZMO_TIP_DIST,
   transform4,
   rayCubeNearT,
+  invert,
+  rayFromCursor,
+  raySphere,
+  rayCapsule,
 } from "./geometry";
 
 // ── WGSL shader ─────────────────────────────────────────────────────────────
@@ -78,11 +82,11 @@ export default function App() {
   // Set while a corner has moved, so the cube's GPU buffer gets rebuilt.
   const dirtyCubeRef = useRef(false);
   // Active gizmo drag: which corner, and which local axis it is sliding along.
-  // `axis` stays null until the first significant movement (so the axis can be
-  // chosen from the drag direction) and then locks for the rest of the drag.
+  // `axis` is locked the moment the gizmo is grabbed (ray-cast), so it never
+  // changes for the duration of the drag.
   const gizmoDragRef = useRef<{
     idx: number;
-    axis: [number, number, number] | null;
+    axis: [number, number, number];
   } | null>(null);
 
   // Which corner is currently selected (-1 / null = none). A ref so the render
@@ -94,6 +98,7 @@ export default function App() {
   const frameRef = useRef<{
     mvp: Float32Array;
     invModel: Float32Array;
+    invViewProj: Float32Array | null;
     cam: [number, number, number];
   } | null>(null);
 
@@ -270,26 +275,48 @@ export default function App() {
         // (Pointer events cover mouse + touch + pen.)
         const FOV = (60 * Math.PI) / 180; // shared by the projection + pan maths
 
-        // Pick the corner nearest the cursor (in CSS pixels), within a threshold.
-        // Uses the transforms captured on the previous frame (frameRef).
-        const PICK_RADIUS = 24;
+        // Pick the corner the cursor's ray passes closest to. The ray is built in
+        // world space from the inverse of (proj·view), then rotated into the cube's
+        // local space (model is rotation-only, so a plain rotation is exact). Each
+        // corner is a small sphere; occluded corners (a cube face in front) are
+        // skipped, and of the visible ones the nearest along the ray wins.
+        const PICK_RADIUS_PX = 24;
         const pick = (clientX: number, clientY: number) => {
           const st = frameRef.current;
-          if (!st) return;
+          if (!st || !st.invViewProj) return;
           const rect = el.getBoundingClientRect();
-          const cx = clientX - rect.left;
-          const cy = clientY - rect.top;
+          const ray = rayFromCursor(
+            st.invViewProj,
+            clientX - rect.left,
+            clientY - rect.top,
+            rect.width,
+            rect.height,
+          );
+          if (!ray) return;
+          // Rotate the world ray into local space.
+          const lo = transform4(st.invModel, ray.ox, ray.oy, ray.oz, 1);
+          const ld = transform4(st.invModel, ray.dx, ray.dy, ray.dz, 0);
+          const ldLen = Math.hypot(ld[0], ld[1], ld[2]) || 1;
+          const ldx = ld[0] / ldLen;
+          const ldy = ld[1] / ldLen;
+          const ldz = ld[2] / ldLen;
+          // A constant *screen* grab target: convert the pixel radius to local
+          // units (model has no scale, so local units == world units here).
+          const worldPerPx =
+            (2 * distanceRef.current * Math.tan(FOV / 2)) / (el.clientHeight || 1);
+          const radius = PICK_RADIUS_PX * worldPerPx;
+          // Where the ray first enters the cube: a face in front ⇒ that corner
+          // is occluded.
+          const tCube = rayCubeNearT(lo[0], lo[1], lo[2], ldx, ldy, ldz);
           let best = -1;
-          let bestD = PICK_RADIUS;
+          let bestT = Infinity;
           for (let i = 0; i < CORNERS.length; i++) {
-            const [vx, vy, vz] = cornersRef.current[i];
-            const clip = transform4(st.mvp, vx, vy, vz, 1);
-            if (clip[3] <= 0) continue; // behind the camera — can't pick it
-            const sx = (clip[0] / clip[3] * 0.5 + 0.5) * rect.width;
-            const sy = (1 - (clip[1] / clip[3] * 0.5 + 0.5)) * rect.height;
-            const d = Math.hypot(sx - cx, sy - cy);
-            if (d < bestD) {
-              bestD = d;
+            const c = cornersRef.current[i];
+            const t = raySphere(lo[0], lo[1], lo[2], ldx, ldy, ldz, c[0], c[1], c[2], radius);
+            if (t === null) continue;
+            if (tCube !== null && tCube < t - 1e-2) continue; // a face is in front
+            if (t < bestT) {
+              bestT = t;
               best = i;
             }
           }
@@ -322,67 +349,57 @@ export default function App() {
           return [bx - ax, by - ay];
         };
 
-        // Of the three local axes, which one's screen projection best matches a
-        // 2D drag delta? Returns the AXIS_DIRS index (0..2) or -1 if none is
-        // projectable (all arrows behind the camera).
-        const bestAxis = (
-          st: NonNullable<typeof frameRef.current>,
-          corner: readonly number[],
-          dx: number,
-          dy: number,
-        ): number => {
-          let best = -1;
-          let bestScore = -Infinity;
-          const dragLen = Math.hypot(dx, dy) || 1;
-          for (let a = 0; a < AXIS_DIRS.length; a++) {
-            const s = screenAxis(st, corner, AXIS_DIRS[a]);
-            const len2 = s[0] * s[0] + s[1] * s[1];
-            if (len2 < 1e-6) continue;
-            const proj = Math.abs(dx * s[0] + dy * s[1]);
-            const score = proj / (dragLen * Math.sqrt(len2));
-            if (score > bestScore) {
-              bestScore = score;
-              best = a;
-            }
-          }
-          return best;
-        };
-
-        // Is the press on the selected vertex's gizmo? Sample the corner and a
-        // few points along each arrow shaft; a hit within the threshold means
-        // "grab the gizmo" rather than "rotate the cube".
-        const GRAB_RADIUS = 28;
-        const grabGizmo = (clientX: number, clientY: number): boolean => {
+        // Is the press on the selected vertex's gizmo? Cast the cursor ray into
+        // the cube's local space and test it against the three arrow capsules; a
+        // hit means "grab the gizmo" rather than "rotate the cube", and the
+        // capsule struck tells us *which axis* (so the drag can lock onto it
+        // immediately). Each arrow is a capsule — a cylindrical shaft plus two
+        // rounded ends — so the grab is exact and orientation-independent.
+        // Returns the AXIS_DIRS index (0..2), or -1 when nothing is under the
+        // cursor.
+        const GRAB_RADIUS = 0.07; // local/world units — constant in 3D by design
+        const grabGizmo = (clientX: number, clientY: number): number => {
           const st = frameRef.current;
           const idx = selectedRef.current;
-          if (!st || idx === null) return false;
+          if (!st || !st.invViewProj || idx === null) return -1;
           const rect = el.getBoundingClientRect();
-          const cx = clientX - rect.left;
-          const cy = clientY - rect.top;
+          const ray = rayFromCursor(
+            st.invViewProj,
+            clientX - rect.left,
+            clientY - rect.top,
+            rect.width,
+            rect.height,
+          );
+          if (!ray) return -1;
+          // Rotate the world ray into local space (model is a pure rotation).
+          const lo = transform4(st.invModel, ray.ox, ray.oy, ray.oz, 1);
+          const ld = transform4(st.invModel, ray.dx, ray.dy, ray.dz, 0);
+          const ldLen = Math.hypot(ld[0], ld[1], ld[2]) || 1;
+          const ldx = ld[0] / ldLen;
+          const ldy = ld[1] / ldLen;
+          const ldz = ld[2] / ldLen;
           const c = cornersRef.current[idx];
-          const near = (p: number[]): boolean => {
-            const clip = transform4(st.mvp, p[0], p[1], p[2], 1);
-            if (clip[3] <= 0) return false;
-            const sx = (clip[0] / clip[3] * 0.5 + 0.5) * rect.width;
-            const sy = (1 - (clip[1] / clip[3] * 0.5 + 0.5)) * rect.height;
-            return Math.hypot(sx - cx, sy - cy) < GRAB_RADIUS;
-          };
-          if (near(c)) return true;
+          let bestAxis = -1;
+          let bestT = Infinity;
           for (let a = 0; a < AXIS_DIRS.length; a++) {
             const d = AXIS_DIRS[a];
-            for (let f = 0.4; f <= 1.0001; f += 0.3) {
-              if (
-                near([
-                  c[0] + d[0] * GIZMO_TIP_DIST * f,
-                  c[1] + d[1] * GIZMO_TIP_DIST * f,
-                  c[2] + d[2] * GIZMO_TIP_DIST * f,
-                ])
-              ) {
-                return true;
-              }
+            const bx = c[0] + d[0] * GIZMO_TIP_DIST;
+            const by = c[1] + d[1] * GIZMO_TIP_DIST;
+            const bz = c[2] + d[2] * GIZMO_TIP_DIST;
+            const t = rayCapsule(
+              lo[0], lo[1], lo[2], ldx, ldy, ldz,
+              c[0], c[1], c[2], bx, by, bz, GRAB_RADIUS,
+            );
+            if (t === null) continue;
+            // Only the arrows are hit-tested — an arrow that overlaps the cube
+            // body is still grabbable, so we take the nearest capsule along the
+            // ray regardless of whether it sits inside the cube.
+            if (t < bestT) {
+              bestT = t;
+              bestAxis = a;
             }
           }
-          return false;
+          return bestAxis;
         };
 
         const onPointerDown = (e: PointerEvent) => {
@@ -391,11 +408,13 @@ export default function App() {
           lastPointerRef.current = { x: e.clientX, y: e.clientY };
           downPointerRef.current = { x: e.clientX, y: e.clientY };
           // A press on the selected vertex's gizmo starts a vertex move instead
-          // of a camera rotation.
-          if (grabGizmo(e.clientX, e.clientY)) {
+          // of a camera rotation. grabGizmo returns the axis the cursor struck,
+          // which is locked for the whole drag.
+          const grabAxis = grabGizmo(e.clientX, e.clientY);
+          if (grabAxis >= 0) {
             gizmoDragRef.current = {
               idx: selectedRef.current as number,
-              axis: null,
+              axis: AXIS_DIRS[grabAxis],
             };
           }
           canvas.setPointerCapture(e.pointerId);
@@ -411,26 +430,11 @@ export default function App() {
 
           // ── Vertex gizmo drag ──
           // When the press grabbed the gizmo, slide the selected corner instead
-          // of turning the camera. The motion axis is the local axis whose
-          // screen projection best matches the drag; it is chosen on the first
-          // significant movement, then held for the rest of the drag.
+          // of turning the camera. The motion axis was locked when the gizmo was
+          // grabbed (ray-cast), so just project the per-frame screen step onto it
+          // to get the local displacement along it.
           const g = gizmoDragRef.current;
           if (g && st) {
-            if (g.axis === null) {
-              // Not enough movement yet to choose a stable axis.
-              if (Math.hypot(adx, ady) < 3) {
-                lastPointerRef.current = { x: e.clientX, y: e.clientY };
-                return;
-              }
-              const ai = bestAxis(st, cornersRef.current[g.idx], adx, ady);
-              if (ai < 0) {
-                lastPointerRef.current = { x: e.clientX, y: e.clientY };
-                return;
-              }
-              g.axis = AXIS_DIRS[ai];
-            }
-            // Project the per-frame screen step onto the chosen axis to get the
-            // local displacement along it.
             const dx = e.clientX - lastPointerRef.current.x;
             const dy = e.clientY - lastPointerRef.current.y;
             const s = screenAxis(st, cornersRef.current[g.idx], g.axis);
@@ -582,13 +586,18 @@ export default function App() {
             rotationY(yawRef.current),
             rotationX(pitchRef.current),
           );
-          const mvp = multiply(multiply(proj, view), model);
+          // proj·view once, so it can feed both the MVP and the picking ray's
+          // inverse.
+          const viewProj = multiply(proj, view);
+          const mvp = multiply(viewProj, model);
           device.queue.writeBuffer(uniformBuffer, 0, mvp);
 
-          // Cache the transforms for the pick handler + occlusion test.
+          // Cache the transforms for the pick/grab handlers + occlusion test.
+          // invViewProj turns a screen pixel into a world-space picking ray.
           frameRef.current = {
             mvp,
             invModel: multiply(rotationX(-pitchRef.current), rotationY(-yawRef.current)),
+            invViewProj: invert(viewProj),
             cam: [panXRef.current, panYRef.current, distanceRef.current],
           };
 

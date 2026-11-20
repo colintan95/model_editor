@@ -273,6 +273,197 @@ export function rayCubeNearT(
   return t0 > 0 ? t0 : t1;
 }
 
+// ── Ray-casting hit testing ─────────────────────────────────────────────────────
+// The pointer is turned into a 3D ray and tested against the geometry directly,
+// which is orientation- and zoom-independent (unlike projecting points to screen
+// and measuring a pixel distance). The ray is built in *world* space from
+// inv(proj·view); the cube's own helpers expect local space, so the caller
+// rotates the ray by invModel before testing it against the axis-aligned cube.
+
+// Inverse of a column-major 4×4 matrix (gl-matrix mat4.invert). Returns null for
+// a singular matrix.
+export function invert(m: Float32Array | number[]): Float32Array<ArrayBuffer> | null {
+  const a00 = m[0], a01 = m[1], a02 = m[2], a03 = m[3];
+  const a10 = m[4], a11 = m[5], a12 = m[6], a13 = m[7];
+  const a20 = m[8], a21 = m[9], a22 = m[10], a23 = m[11];
+  const a30 = m[12], a31 = m[13], a32 = m[14], a33 = m[15];
+
+  // 2×2 minors of the top-left 3×3 block (and the matching bottom-right ones),
+  // used to build the determinant and the adjugate below.
+  const b00 = a00 * a11 - a01 * a10;
+  const b01 = a00 * a12 - a02 * a10;
+  const b02 = a00 * a13 - a03 * a10;
+  const b03 = a01 * a12 - a02 * a11;
+  const b04 = a01 * a13 - a03 * a11;
+  const b05 = a02 * a13 - a03 * a12;
+  const b06 = a20 * a31 - a21 * a30;
+  const b07 = a20 * a32 - a22 * a30;
+  const b08 = a20 * a33 - a23 * a30;
+  const b09 = a21 * a32 - a22 * a31;
+  const b10 = a21 * a33 - a23 * a31;
+  const b11 = a22 * a33 - a23 * a32;
+
+  const det =
+    b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
+  if (Math.abs(det) < 1e-20) return null;
+  const idet = 1 / det;
+
+  // adjugate = transpose(cofactor): out[col·4+row] = (−1)^(row+col)·minor(col,row).
+  const out = new Float32Array(16);
+  out[0] = (a11 * (a22 * a33 - a32 * a23) - a21 * (a12 * a33 - a32 * a13) + a31 * (a12 * a23 - a22 * a13)) * idet;
+  out[1] = -(a01 * (a22 * a33 - a32 * a23) - a21 * (a02 * a33 - a32 * a03) + a31 * (a02 * a23 - a22 * a03)) * idet;
+  out[2] = (a01 * (a12 * a33 - a32 * a13) - a11 * (a02 * a33 - a32 * a03) + a31 * (a02 * a13 - a12 * a03)) * idet;
+  out[3] = -(a01 * (a12 * a23 - a22 * a13) - a11 * (a02 * a23 - a22 * a03) + a21 * (a02 * a13 - a12 * a03)) * idet;
+  out[4] = -(a10 * (a22 * a33 - a32 * a23) - a20 * (a12 * a33 - a32 * a13) + a30 * (a12 * a23 - a22 * a13)) * idet;
+  out[5] = (a00 * (a22 * a33 - a32 * a23) - a20 * (a02 * a33 - a32 * a03) + a30 * (a02 * a23 - a22 * a03)) * idet;
+  out[6] = -(a00 * (a12 * a33 - a32 * a13) - a10 * (a02 * a33 - a32 * a03) + a30 * (a02 * a13 - a12 * a03)) * idet;
+  out[7] = (a00 * (a12 * a23 - a22 * a13) - a10 * (a02 * a23 - a22 * a03) + a20 * (a02 * a13 - a12 * a03)) * idet;
+  out[8] = (a10 * (a21 * a33 - a31 * a23) - a20 * (a11 * a33 - a31 * a13) + a30 * (a11 * a23 - a21 * a13)) * idet;
+  out[9] = -(a00 * (a21 * a33 - a31 * a23) - a20 * (a01 * a33 - a31 * a03) + a30 * (a01 * a23 - a21 * a03)) * idet;
+  out[10] = (a00 * (a11 * a33 - a31 * a13) - a10 * (a01 * a33 - a31 * a03) + a30 * (a01 * a13 - a11 * a03)) * idet;
+  out[11] = -(a00 * (a11 * a23 - a21 * a13) - a10 * (a01 * a23 - a21 * a03) + a20 * (a01 * a13 - a11 * a03)) * idet;
+  out[12] = -(a10 * (a21 * a32 - a31 * a22) - a20 * (a11 * a32 - a31 * a12) + a30 * (a11 * a22 - a21 * a12)) * idet;
+  out[13] = (a00 * (a21 * a32 - a31 * a22) - a20 * (a01 * a32 - a31 * a02) + a30 * (a01 * a22 - a21 * a02)) * idet;
+  out[14] = -(a00 * (a11 * a32 - a31 * a12) - a10 * (a01 * a32 - a31 * a02) + a30 * (a01 * a12 - a11 * a02)) * idet;
+  out[15] = (a00 * (a11 * a22 - a21 * a12) - a10 * (a01 * a22 - a21 * a02) + a20 * (a01 * a12 - a11 * a02)) * idet;
+  return out;
+}
+
+// Build a picking ray in the space that `invViewProj` maps *from* (world space
+// when it is the inverse of proj·view). `cx`/`cy` are CSS pixels within a
+// `rectW`×`rectH` viewport. Returns a normalized [origin, dir], or null when the
+// point is behind the camera.
+export function rayFromCursor(
+  invViewProj: Float32Array | number[],
+  cx: number,
+  cy: number,
+  rectW: number,
+  rectH: number,
+): {
+  ox: number;
+  oy: number;
+  oz: number;
+  dx: number;
+  dy: number;
+  dz: number;
+} | null {
+  // CSS pixels → NDC. Y is flipped (screen top is +NDC-y).
+  const ndcx = (cx / rectW) * 2 - 1;
+  const ndcy = 1 - (cy / rectH) * 2;
+  // Unproject near (z = -1) and far (z = +1) points, then divide by w.
+  const near = transform4(invViewProj, ndcx, ndcy, -1, 1);
+  const far = transform4(invViewProj, ndcx, ndcy, 1, 1);
+  if (near[3] === 0 || far[3] === 0) return null;
+  const nx = near[0] / near[3];
+  const ny = near[1] / near[3];
+  const nz = near[2] / near[3];
+  const fx = far[0] / far[3];
+  const fy = far[1] / far[3];
+  const fz = far[2] / far[3];
+  let dx = fx - nx;
+  let dy = fy - ny;
+  let dz = fz - nz;
+  const dl = Math.hypot(dx, dy, dz) || 1;
+  dx /= dl;
+  dy /= dl;
+  dz /= dl;
+  return { ox: nx, oy: ny, oz: nz, dx, dy, dz };
+}
+
+// First intersection parameter t (≥ 0) of a ray with a sphere, or null on miss.
+// Ray: P(t) = origin + t·dir, with `dir` normalized so t is in world units.
+export function raySphere(
+  ox: number,
+  oy: number,
+  oz: number,
+  dx: number,
+  dy: number,
+  dz: number,
+  cx: number,
+  cy: number,
+  cz: number,
+  r: number,
+): number | null {
+  const mx = ox - cx;
+  const my = oy - cy;
+  const mz = oz - cz;
+  const b = mx * dx + my * dy + mz * dz;
+  const c = mx * mx + my * my + mz * mz - r * r;
+  const disc = b * b - c;
+  if (disc < 0) return null;
+  const sq = Math.sqrt(disc);
+  const t1 = -b - sq; // near intersection
+  if (t1 > 1e-9) return t1;
+  const t2 = -b + sq; // far intersection — the relevant one when the ray starts inside
+  return t2 > 1e-9 ? t2 : null; // both behind the ray ⇒ miss
+}
+
+// First intersection parameter t (≥ 0) of a ray with a capsule — a segment
+// a→b thickened to radius `r` (a cylinder capped by two hemispheres). Returns
+// null on a miss. Used to hit-test the gizmo arrows exactly, which also reports
+// *which* arrow (and therefore which axis) was struck.
+export function rayCapsule(
+  ox: number,
+  oy: number,
+  oz: number,
+  dx: number,
+  dy: number,
+  dz: number,
+  ax: number,
+  ay: number,
+  az: number,
+  bx: number,
+  by: number,
+  bz: number,
+  r: number,
+): number | null {
+  // The two rounded ends are full spheres around each endpoint.
+  let t = raySphere(ox, oy, oz, dx, dy, dz, ax, ay, az, r);
+  const tb = raySphere(ox, oy, oz, dx, dy, dz, bx, by, bz, r);
+  if (tb !== null) t = t === null ? tb : Math.min(t, tb);
+
+  // Cylindrical middle: project the ray into the plane perpendicular to the
+  // segment axis (which sits at the origin of that plane) and solve for where
+  // its distance to the axis equals r, keeping only the hit whose axial
+  // coordinate lies between the two endpoints.
+  const kx = bx - ax;
+  const ky = by - ay;
+  const kz = bz - az;
+  const L2 = kx * kx + ky * ky + kz * kz;
+  if (L2 < 1e-12) return t; // degenerate segment — the caps above already cover it
+  const L = Math.sqrt(L2);
+  const ikx = kx / L;
+  const iky = ky / L;
+  const ikz = kz / L;
+
+  // Ray origin relative to the segment start, split into along-axis + perp parts.
+  const mx = ox - ax;
+  const my = oy - ay;
+  const mz = oz - az;
+  const mDotK = mx * ikx + my * iky + mz * ikz;
+  const mpx = mx - mDotK * ikx;
+  const mpy = my - mDotK * iky;
+  const mpz = mz - mDotK * ikz;
+  const dDotK = dx * ikx + dy * iky + dz * ikz;
+  const dpx = dx - dDotK * ikx;
+  const dpy = dy - dDotK * iky;
+  const dpz = dz - dDotK * ikz;
+
+  const A = dpx * dpx + dpy * dpy + dpz * dpz;
+  if (A < 1e-12) return t; // ray parallel to the axis — the caps already cover it
+  const B = 2 * (mpx * dpx + mpy * dpy + mpz * dpz);
+  const C = mpx * mpx + mpy * mpy + mpz * mpz - r * r;
+  const disc = B * B - 4 * A * C;
+  if (disc < 0) return t;
+  const sq = Math.sqrt(disc);
+  let s = (-B - sq) / (2 * A);
+  if (s < 0) s = (-B + sq) / (2 * A);
+  if (s < 0) return t;
+  const zAxis = mDotK + s * dDotK; // axial position of the hit
+  if (zAxis < 0 || zAxis > L) return t; // struck a rounded end, not the shaft
+  return t === null ? s : Math.min(t, s);
+}
+
 // ── Vertex translation gizmo ────────────────────────────────────────────────
 // Three arrows — one per positive axis — that sit on the selected vertex and
 // rotate with the cube. Each arrow is a short cylindrical shaft topped by a
